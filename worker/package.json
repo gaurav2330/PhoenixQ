@@ -1,0 +1,10 @@
+{
+  "name": "job-worker",
+  "type": "module",
+  "scripts": {
+    "start": "node src/worker.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}
