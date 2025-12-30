@@ -7,8 +7,8 @@ console.log('[WORKER] Worker started, waiting for jobs...');
 
 async function poll () {
   await requeueExpiredJobs();
-  const now = Date.now();
 
+  const now = Date.now();
   const jobIds = await redis.zrangebyscore(QUEUE_KEY, "-inf", now, "LIMIT", 0, 1);
 
   if (jobIds.length === 0) {
@@ -18,7 +18,6 @@ async function poll () {
   }
 
   const jobId = jobIds[0];
-
   const visibilityDeadline = now + VISIBILITY_TIMEOUT_MS;
 
   // move job to processing set
@@ -35,7 +34,6 @@ async function poll () {
   }
 
   const job = JSON.parse(raw);
-
   job.status = 'processing';
   await redis.set(`job:${jobId}`, JSON.stringify(job));
 
@@ -44,68 +42,82 @@ async function poll () {
     if (alreadyCompleted) {
       console.warn(`[WORKER] Job ${jobId} already completed (idempotent). Skipping processing.`);
 
-      job.status = 'completed';
-      job.updatedAt = Date.now();
-      await redis.set(`job:${jobId}`, JSON.stringify(job));
-      await redis.zrem(PROCESSING_KEY, jobId);
+      await markCompleted(jobId, job);
       return;
     }
 
     await handleJob(job);
-
     await markIdempotent(job.idempotencyKey);
-
-    job.status = 'completed';
-    job.updatedAt = Date.now();
-    await redis.set(`job:${jobId}`, JSON.stringify(job));
-    await redis.zrem(PROCESSING_KEY, jobId);
+    await markCompleted(jobId, job);
 
     console.log(`[WORKER] Successfully completed job ${jobId}`);
   } catch (err) {
-    job.attempts += 1;
-    job.error = {
-      message: err.message,
-      failedAt: Date.now()
-    }
+    updateJobFailure(job, err);
 
     if (job.attempts >= job.maxAttempts) {
-      job.status = 'dead';
-      job.deadAt = Date.now();
-      job.updatedAt = Date.now();
-      
-      await redis
-        .multi()
-        .set(`job:${jobId}`, JSON.stringify(job))
-        .zrem(PROCESSING_KEY, jobId)
-        .zadd(DLQ_KEY, job.deadAt, jobId)
-        .exec();
-
-      console.error(`[WORKER] Job ${jobId} failed after ${job.attempts} attempts. Moved to DLQ.`);
+      await markJobAsDead(jobId, job);
       return;
     }
 
     // retry with backoff
-    const delay = BASE_RETRY_DELAY_MS * Math.pow(2, job.attempts);
-    const nextAvailableAt = Date.now() + delay;
-
-    job.status = 'queued';
-    job.updatedAt = Date.now();
-    job.availableAt = nextAvailableAt;
-
-    await redis
-      .multi()
-      .set(`job:${jobId}`, JSON.stringify(job))
-      .zrem(PROCESSING_KEY, jobId)
-      .zadd(QUEUE_KEY, nextAvailableAt, jobId)
-      .exec();
-
-    console.warn(`[WORKER] Job ${jobId} failed on attempt ${job.attempts}. Retrying in ${delay} ms.`);
+    await retryJob(jobId, job);
   }
 }
 
+// Mark job as completed
+async function markCompleted (jobId, job) {
+  job.status = 'completed';
+  job.updatedAt = Date.now();
+  await redis.set(`job:${jobId}`, JSON.stringify(job));
+  await redis.zrem(PROCESSING_KEY, jobId);
+}
+
+// Exponential backoff retry
+async function retryJob (jobId, job) {
+  const delay = BASE_RETRY_DELAY_MS * Math.pow(2, job.attempts);
+  const nextAvailableAt = Date.now() + delay;
+
+  job.status = 'queued';
+  job.updatedAt = Date.now();
+  job.availableAt = nextAvailableAt;
+
+  await redis
+    .multi()
+    .set(`job:${jobId}`, JSON.stringify(job))
+    .zrem(PROCESSING_KEY, jobId)
+    .zadd(QUEUE_KEY, nextAvailableAt, jobId)
+    .exec();
+
+  console.warn(`[WORKER] Job ${jobId} failed on attempt ${job.attempts}. Retrying in ${delay} ms.`);
+}
+
+// Mark job as dead and move to DLQ
+async function markJobAsDead (jobId, job) {
+  job.status = 'dead';
+  job.deadAt = Date.now();
+  job.updatedAt = Date.now();
+  
+  await redis
+    .multi()
+    .set(`job:${jobId}`, JSON.stringify(job))
+    .zrem(PROCESSING_KEY, jobId)
+    .zadd(DLQ_KEY, job.deadAt, jobId)
+    .exec();
+
+  console.error(`[WORKER] Job ${jobId} failed after ${job.attempts} attempts. Moved to DLQ.`);
+}
+
+function updateJobFailure (job, err) {
+  job.attempts += 1;
+  job.error = {
+    message: err.message,
+    failedAt: Date.now()
+  };
+}
+
+// Re-queue jobs that have exceeded their visibility timeout
 async function requeueExpiredJobs () {
   const now = Date.now();
-
   const expiredJobIds = await redis.zrangebyscore(PROCESSING_KEY, "-inf", now);
 
   for (const jobId of expiredJobIds) {
@@ -119,6 +131,7 @@ async function requeueExpiredJobs () {
   }
 }
 
+// Main worker loop
 async function start () {
   while (true) {
     try {
@@ -129,4 +142,5 @@ async function start () {
   }
 }
 
+// Kick off the worker
 start();
