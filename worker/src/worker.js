@@ -2,8 +2,7 @@ import { redis } from './redis.js';
 import { QUEUE_KEY, PROCESSING_KEY, VISIBILITY_TIMEOUT_MS, DLQ_KEY, BASE_RETRY_DELAY_MS } from './constants.js';
 import { handleJob } from './handlers.js';
 import { isIdempotent, markIdempotent } from './idempotency.js';
-
-console.log('[WORKER] Worker started, waiting for jobs...');
+import { log } from './logger.js';
 
 async function poll () {
   await requeueExpiredJobs();
@@ -20,6 +19,12 @@ async function poll () {
   const jobId = jobIds[0];
   const visibilityDeadline = now + VISIBILITY_TIMEOUT_MS;
 
+  log("info", "job_started", {
+    jobId: job.id,
+    correlationId: job.correlationId,
+    attempt: job.attempts
+  });
+
   // move job to processing set
   await redis
     .multi()
@@ -29,7 +34,7 @@ async function poll () {
 
   const raw = await redis.get(`job:${jobId}`);
   if (!raw) {
-    console.error(`[WORKER] Job data not found for job ID ${jobId}`);
+    log("error", "job_data_not_found", { jobId });
     return;
   }
 
@@ -40,7 +45,7 @@ async function poll () {
   try {
     const alreadyCompleted = await isIdempotent(job.idempotencyKey);
     if (alreadyCompleted) {
-      console.warn(`[WORKER] Job ${jobId} already completed (idempotent). Skipping processing.`);
+      log("warn", `Job ${jobId} already completed (idempotent). Skipping processing.`);
 
       await markCompleted(jobId, job);
       return;
@@ -50,7 +55,11 @@ async function poll () {
     await markIdempotent(job.idempotencyKey);
     await markCompleted(jobId, job);
 
-    console.log(`[WORKER] Successfully completed job ${jobId}`);
+    log("info", `job_completed`, {
+      jobId: job.id,
+      correlationId: job.correlationId,
+      durationMs: Date.now() - now
+    });
   } catch (err) {
     updateJobFailure(job, err);
 
@@ -88,7 +97,12 @@ async function retryJob (jobId, job) {
     .zadd(QUEUE_KEY, nextAvailableAt, jobId)
     .exec();
 
-  console.warn(`[WORKER] Job ${jobId} failed on attempt ${job.attempts}. Retrying in ${delay} ms.`);
+  log("warn", `job_retry_scheduled`, {
+    jobId: job.id,
+    correlationId: job.correlationId,
+    attempt: job.attempts,
+    nextAvailableAt
+  });
 }
 
 // Mark job as dead and move to DLQ
@@ -104,7 +118,13 @@ async function markJobAsDead (jobId, job) {
     .zadd(DLQ_KEY, job.deadAt, jobId)
     .exec();
 
-  console.error(`[WORKER] Job ${jobId} failed after ${job.attempts} attempts. Moved to DLQ.`);
+  await redis.incr("metrics:jobs:dlq");
+
+  log("error", `job_dead_lettered`, {
+    jobId: job.id,
+    correlationId: job.correlationId,
+    attempts: job.attempts
+  });
 }
 
 function updateJobFailure (job, err) {
@@ -121,7 +141,7 @@ async function requeueExpiredJobs () {
   const expiredJobIds = await redis.zrangebyscore(PROCESSING_KEY, "-inf", now);
 
   for (const jobId of expiredJobIds) {
-    console.log(`[WORKER] Re-queuing expired job ${jobId}`);
+    log("info", `requeuing_expired_job`, { jobId });
 
     await redis
       .multi()
@@ -137,7 +157,7 @@ async function start () {
     try {
       await poll();
     } catch (err) {
-      console.error('[WORKER] Error processing job:', err);
+      log("error", "Error processing job:", { err });
     }
   }
 }

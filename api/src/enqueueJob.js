@@ -3,8 +3,9 @@ import { redis } from './redis.js';
 
 const QUEUE_KEY = "queues:jobs";
 
-export async function enqueueJob({ type, payload }) {
+export async function enqueueJob({ type, payload, correlationId }) {
   const jobId = uuid();
+  const corrId = correlationId || uuid();
   const now = Date.now();
 
   const job = {
@@ -18,6 +19,7 @@ export async function enqueueJob({ type, payload }) {
     updatedAt: now,
     availableAt: now,
     idempotencyKey: jobId,
+    correlationId: corrId,
     error: null
   };
 
@@ -27,6 +29,15 @@ export async function enqueueJob({ type, payload }) {
   // add to sorted set for processing
   await redis.zadd(QUEUE_KEY, now, jobId);
 
-  console.log(`[API] Enqueued job ${jobId} of type ${type}`);
+  console.log(
+    JSON.stringify({
+      level: "info",
+      msg: "job_enqueued",
+      jobId,
+      correlationId: corrId,
+      type,
+    })
+  );
+
   return { jobId,  status: 'queued' };
 }
